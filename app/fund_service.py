@@ -5,7 +5,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -15,6 +15,7 @@ EASTMONEY_FUND_SCRIPT = "https://fund.eastmoney.com/pingzhongdata/{code}.js"
 EASTMONEY_HOLDINGS = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNInverstPosition"
 EASTMONEY_QUOTES = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 USER_AGENT = "Mozilla/5.0 (compatible; FundLens/1.0; personal fund dashboard)"
+CHINA_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 class FundDataError(RuntimeError):
@@ -105,7 +106,9 @@ def _parse_fund_script(text: str) -> dict[str, Any]:
         raise FundDataError("暂无官方净值记录")
 
     latest = nav_trend[-1]
-    nav_date = datetime.fromtimestamp(latest["x"] / 1000).strftime("%Y-%m-%d")
+    # East Money timestamps represent China calendar dates. Render containers run
+    # in UTC, so using the server's local timezone would display the prior day.
+    nav_date = datetime.fromtimestamp(latest["x"] / 1000, tz=CHINA_TZ).strftime("%Y-%m-%d")
     official_change = float(latest.get("equityReturn") or 0)
 
     stock_position = 0.0
@@ -289,7 +292,7 @@ class FundService:
             confidence = "较低"
 
         estimated_nav = info["officialNav"] * (1 + estimated_change / 100)
-        now = datetime.now().astimezone()
+        now = datetime.now(CHINA_TZ)
         warnings = ["估值依据最近一期披露持仓推算，不等于基金公司最终净值。"]
         if not holdings:
             warnings.append("未获取到股票持仓，当前仅展示官方净值。")

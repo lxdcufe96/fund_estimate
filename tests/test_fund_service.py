@@ -11,6 +11,7 @@ def test_parse_fund_script():
     assert result["name"] == "测试基金"
     assert result["officialNav"] == 1.2345
     assert result["stockPositionPct"] == 65.5
+    assert result["navDate"] == "2026-07-20"
 
 
 def test_parse_holdings():
@@ -26,4 +27,3 @@ def test_parse_quotes_scaling():
     result = _parse_quotes(payload)
     assert result["600000"]["price"] == 12.34
     assert result["600000"]["changePct"] == -0.56
-
