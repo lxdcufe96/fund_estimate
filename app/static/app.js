@@ -62,10 +62,6 @@ function renderResult(card, data) {
   estimatedChange.className = `estimated-change ${directionClass(data.estimatedChangePct)}`;
   card.querySelector('.official-nav').textContent = Number(data.officialNav).toFixed(4);
   card.querySelector('.official-date').textContent = `${data.navDate} · ${signed(data.officialChangePct)}`;
-  card.querySelector('.confidence').textContent = data.confidence;
-  card.querySelector('.coverage').textContent = `${data.quoteCoveragePct}% 行情覆盖`;
-  card.querySelector('.meter i').style.width = `${Math.min(data.quoteCoveragePct, 100)}%`;
-
   card.querySelector('.facts').innerHTML = [
     `股票仓位 ${data.stockPositionPct}%`,
     `前十大占比 ${data.disclosedWeightPct}%`,
@@ -79,7 +75,6 @@ function renderResult(card, data) {
       <small>${escapeHtml(item.code)} · 权重 ${item.weightPct}%</small><small>${item.price == null ? '' : item.price.toFixed(2)}</small>
     </div>
   `).join('') || '<div class="holding"><span>暂无股票持仓数据</span></div>';
-  card.querySelector('.warning').textContent = data.warnings.join(' ');
 }
 
 function renderError(card, error) {
