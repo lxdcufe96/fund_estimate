@@ -31,24 +31,19 @@ function escapeHtml(value) {
   })[char]);
 }
 
-function formatTime(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-}
-
-function updateSummary() {
-  document.querySelector('#fund-count').textContent = state.funds.length;
-  const values = [...state.results.values()].filter(item => !item.error);
-  const up = values.filter(item => item.estimatedChangePct >= 0).length;
-  const down = values.filter(item => item.estimatedChangePct < 0).length;
-  document.querySelector('#direction-count').textContent = values.length ? `${up} / ${down}` : '—';
-}
-
 function createCard(code) {
   const card = template.content.firstElementChild.cloneNode(true);
   card.dataset.code = code;
   card.querySelector('.fund-code').textContent = code;
-  card.querySelector('.remove-button').addEventListener('click', () => removeFund(code));
+  const summary = card.querySelector('.card-summary');
+  summary.addEventListener('click', () => {
+    const expanded = card.classList.toggle('expanded');
+    summary.setAttribute('aria-expanded', String(expanded));
+  });
+  card.querySelector('.remove-button').addEventListener('click', event => {
+    event.stopPropagation();
+    removeFund(code);
+  });
   list.append(card);
   return card;
 }
@@ -61,7 +56,10 @@ function renderResult(card, data) {
   estimatedChange.textContent = signed(data.estimatedChangePct);
   estimatedChange.className = `estimated-change ${directionClass(data.estimatedChangePct)}`;
   card.querySelector('.official-nav').textContent = Number(data.officialNav).toFixed(4);
-  card.querySelector('.official-date').textContent = `${data.navDate} · ${signed(data.officialChangePct)}`;
+  const officialChange = card.querySelector('.official-change');
+  officialChange.textContent = signed(data.officialChangePct);
+  officialChange.className = `official-change ${directionClass(data.officialChangePct)}`;
+  card.querySelector('.official-date').textContent = data.navDate;
   card.querySelector('.facts').innerHTML = [
     `股票仓位 ${data.stockPositionPct}%`,
     `前十大占比 ${data.disclosedWeightPct}%`,
@@ -93,16 +91,13 @@ async function loadFund(code) {
     if (!response.ok) throw new Error(body.detail || '数据读取失败');
     state.results.set(code, body);
     renderResult(card, body);
-    document.querySelector('#global-status').textContent = body.marketStatus;
   } catch (error) {
     state.results.set(code, { error: error.message });
     renderError(card, error.message);
   }
-  updateSummary();
 }
 
 async function refreshAll() {
-  document.querySelector('#global-status').textContent = '正在同步';
   await Promise.all(state.funds.map(loadFund));
   document.querySelector('#last-refresh').textContent = `最后刷新 ${new Date().toLocaleTimeString('zh-CN')}`;
 }
@@ -125,7 +120,6 @@ function addFund() {
   message.textContent = `已加入 ${code}，正在估值。`;
   createCard(code);
   loadFund(code);
-  updateSummary();
 }
 
 function removeFund(code) {
@@ -133,7 +127,6 @@ function removeFund(code) {
   state.results.delete(code);
   save();
   list.querySelector(`[data-code="${code}"]`)?.remove();
-  updateSummary();
 }
 
 document.querySelector('#add-button').addEventListener('click', addFund);
@@ -141,6 +134,5 @@ document.querySelector('#refresh-button').addEventListener('click', refreshAll);
 input.addEventListener('keydown', event => { if (event.key === 'Enter') addFund(); });
 
 state.funds.forEach(createCard);
-updateSummary();
 refreshAll();
 setInterval(refreshAll, 60_000);
