@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -16,6 +17,15 @@ EASTMONEY_HOLDINGS = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNInverst
 EASTMONEY_QUOTES = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 USER_AGENT = "Mozilla/5.0 (compatible; FundLens/1.0; personal fund dashboard)"
 CHINA_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
+FUND_INFO_TTL = 21600
+HOLDINGS_TTL = 86400
+QUOTES_TTL = 20
+REFRESH_INTERVAL = 60
+ACTIVE_CODE_TTL = 86400
+MAX_FUNDS_PER_REQUEST = 100
+QUOTE_BATCH_SIZE = 80
+
+logger = logging.getLogger(__name__)
 
 
 class FundDataError(RuntimeError):
@@ -44,6 +54,11 @@ class TTLCache:
     async def set(self, key: str, value: Any, ttl: int) -> None:
         async with self._lock:
             self._items[key] = CacheEntry(time.time() + ttl, value)
+
+    async def get_stale(self, key: str) -> Any | None:
+        async with self._lock:
+            entry = self._items.get(key)
+            return entry.value if entry else None
 
 
 cache = TTLCache()
@@ -185,11 +200,15 @@ def _parse_quotes(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         raw_price = row.get("f2")
         if not code or raw_change in (None, "-"):
             continue
-        result[code] = {
+        market = str(row.get("f13") or "")
+        quote = {
             "name": row.get("f14") or code,
             "price": None if raw_price in (None, "-") else round(float(raw_price) / 100, 4),
             "changePct": round(float(raw_change) / 100, 4),
         }
+        result[code] = quote
+        if market:
+            result[f"{market}.{code}"] = quote
     return result
 
 
@@ -200,68 +219,139 @@ class FundService:
             follow_redirects=True,
             headers={"User-Agent": USER_AGENT},
         )
+        self._active_codes: dict[str, float] = {}
+        self._snapshots: dict[str, dict[str, Any]] = {}
+        self._snapshot_times: dict[str, float] = {}
+        self._last_errors: dict[str, str] = {}
+        self._state_lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
+        self._metadata_semaphore = asyncio.Semaphore(8)
+        self._quote_semaphore = asyncio.Semaphore(4)
+        self._background_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        if self._background_task is None:
+            self._background_task = asyncio.create_task(
+                self._refresh_loop(), name="fund-snapshot-refresh"
+            )
 
     async def close(self) -> None:
+        if self._background_task:
+            self._background_task.cancel()
+            try:
+                await self._background_task
+            except asyncio.CancelledError:
+                pass
         await self.client.aclose()
+
+    async def _get_with_retry(
+        self, url: str, *, params: dict[str, str] | None = None
+    ) -> httpx.Response:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await self.client.get(url, params=params)
+                response.raise_for_status()
+                return response
+            except (httpx.HTTPError, httpx.TimeoutException) as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.35 * (2 ** attempt))
+        assert last_error is not None
+        raise last_error
 
     async def _fund_info(self, code: str) -> dict[str, Any]:
         key = f"fund:{code}"
         cached = await cache.get(key)
         if cached:
             return cached
-        response = await self.client.get(EASTMONEY_FUND_SCRIPT.format(code=code))
-        if response.status_code != 200 or "notfound" in str(response.url):
-            raise FundDataError("基金代码不存在或官方净值源暂不可用")
-        info = _parse_fund_script(response.text)
-        await cache.set(key, info, 3600)
-        return info
+        stale = await cache.get_stale(key)
+        try:
+            response = await self._get_with_retry(EASTMONEY_FUND_SCRIPT.format(code=code))
+            if "notfound" in str(response.url):
+                raise FundDataError("基金代码不存在或官方净值源暂不可用")
+            info = _parse_fund_script(response.text)
+            # The script is large and official NAV changes only once a day.
+            await cache.set(key, info, FUND_INFO_TTL)
+            return info
+        except Exception:
+            if stale:
+                logger.warning("fund info refresh failed; using stale cache for %s", code)
+                return stale
+            raise
 
     async def _holdings(self, code: str) -> tuple[list[dict[str, Any]], str | None]:
         key = f"holdings:{code}"
         cached = await cache.get(key)
         if cached:
             return cached
-        response = await self.client.get(
-            EASTMONEY_HOLDINGS,
-            params={
+        stale = await cache.get_stale(key)
+        try:
+            response = await self._get_with_retry(
+                EASTMONEY_HOLDINGS,
+                params={
                 "FCODE": code,
                 "deviceid": "Wap",
                 "plat": "Wap",
                 "product": "EFund",
                 "version": "2.0.0",
-            },
-        )
-        response.raise_for_status()
-        value = _parse_holdings(response.json())
-        await cache.set(key, value, 21600)
-        return value
+                },
+            )
+            value = _parse_holdings(response.json())
+            # Check once a day; Expansion carries the latest report date.
+            await cache.set(key, value, HOLDINGS_TTL)
+            return value
+        except Exception:
+            if stale:
+                logger.warning("holdings refresh failed; using stale cache for %s", code)
+                return stale
+            raise
 
     async def _quotes(self, holdings: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if not holdings:
             return {}
-        secids = ",".join(f"{item['market']}.{item['code']}" for item in holdings)
-        response = await self.client.get(
-            EASTMONEY_QUOTES,
-            params={"secids": secids, "fields": "f2,f3,f12,f14"},
-        )
-        response.raise_for_status()
-        return _parse_quotes(response.json())
+        unique = sorted({f"{item['market']}.{item['code']}" for item in holdings})
+        secids = ",".join(unique)
+        key = f"quotes:{secids}"
+        cached = await cache.get(key)
+        if cached is not None:
+            return cached
+        stale = await cache.get_stale(key)
+        chunks = [unique[index:index + QUOTE_BATCH_SIZE] for index in range(0, len(unique), QUOTE_BATCH_SIZE)]
 
-    async def estimate(self, code: str) -> dict[str, Any]:
-        if not re.fullmatch(r"\d{6}", code):
-            raise FundDataError("请输入正确的 6 位基金代码")
+        async def fetch_chunk(chunk: list[str]) -> dict[str, dict[str, Any]]:
+            async with self._quote_semaphore:
+                response = await self._get_with_retry(
+                    EASTMONEY_QUOTES,
+                    params={"secids": ",".join(chunk), "fields": "f2,f3,f12,f13,f14"},
+                )
+            return _parse_quotes(response.json())
 
-        info, holding_result = await asyncio.gather(
-            self._fund_info(code), self._holdings(code)
-        )
-        holdings, holding_date = holding_result
-        quotes = await self._quotes(holdings)
+        try:
+            parts = await asyncio.gather(*(fetch_chunk(chunk) for chunk in chunks))
+            value: dict[str, dict[str, Any]] = {}
+            for part in parts:
+                value.update(part)
+            await cache.set(key, value, QUOTES_TTL)
+            return value
+        except Exception:
+            if stale:
+                logger.warning("quote refresh failed; using stale quote cache")
+                return stale
+            raise
 
+    def _build_estimate(
+        self,
+        info: dict[str, Any],
+        holdings: list[dict[str, Any]],
+        holding_date: str | None,
+        quotes: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
         weighted_change = 0.0
         quoted_weight = 0.0
         detailed: list[dict[str, Any]] = []
         for holding in holdings:
-            quote = quotes.get(holding["code"])
+            quote = quotes.get(f"{holding['market']}.{holding['code']}") or quotes.get(holding["code"])
             item = {**holding, "price": None, "changePct": None, "contributionPct": None}
             if quote:
                 weight = holding["weightPct"]
@@ -296,6 +386,8 @@ class FundService:
         warnings = ["估值依据最近一期披露持仓推算，不等于基金公司最终净值。"]
         if not holdings:
             warnings.append("未获取到股票持仓，当前仅展示官方净值。")
+        elif quoted_weight == 0:
+            warnings.append("实时行情暂不可用，当前估算净值暂按最新官方净值显示。")
         if stock_position < 30:
             warnings.append("股票仓位较低，债券、现金及其他资产未实时估值。")
         if any(item["market"] not in {"0", "1"} for item in holdings):
@@ -317,3 +409,161 @@ class FundService:
             "warnings": warnings,
             "method": "最近披露股票持仓加权涨跌 × 股票仓位",
         }
+
+    @staticmethod
+    def _normalise_codes(
+        codes: list[str], limit: int | None = MAX_FUNDS_PER_REQUEST
+    ) -> list[str]:
+        normalised = list(
+            dict.fromkeys(code.strip() for code in codes if code.strip())
+        )
+        return normalised if limit is None else normalised[:limit]
+
+    async def _register_active(self, codes: list[str]) -> None:
+        now = time.monotonic()
+        async with self._state_lock:
+            for code in codes:
+                self._active_codes[code] = now
+
+    async def _active_code_list(self) -> list[str]:
+        cutoff = time.monotonic() - ACTIVE_CODE_TTL
+        async with self._state_lock:
+            expired = [code for code, seen_at in self._active_codes.items() if seen_at < cutoff]
+            for code in expired:
+                self._active_codes.pop(code, None)
+                self._snapshots.pop(code, None)
+                self._snapshot_times.pop(code, None)
+                self._last_errors.pop(code, None)
+            return list(self._active_codes)
+
+    async def _refresh_codes(
+        self,
+        codes: list[str],
+        *,
+        force: bool = False,
+        limit: int | None = MAX_FUNDS_PER_REQUEST,
+    ) -> None:
+        """Refresh snapshots once for a set of funds.
+
+        A global refresh lock prevents a burst of users from duplicating the
+        same upstream work. Quote requests are shared across every fund in this
+        refresh and split into URL-safe chunks.
+        """
+        unique_codes = self._normalise_codes(codes, limit=limit)
+        if not unique_codes:
+            return
+
+        async with self._refresh_lock:
+            if not force:
+                cutoff = time.monotonic() - REFRESH_INTERVAL
+                async with self._state_lock:
+                    unique_codes = [
+                        code for code in unique_codes
+                        if self._snapshot_times.get(code, 0) < cutoff
+                    ]
+                if not unique_codes:
+                    return
+
+            prepared: dict[str, tuple[dict[str, Any], list[dict[str, Any]], str | None]] = {}
+            errors: dict[str, str] = {}
+
+            async def prepare(code: str) -> None:
+                if not re.fullmatch(r"\d{6}", code):
+                    errors[code] = "请输入正确的 6 位基金代码"
+                    return
+                try:
+                    async with self._metadata_semaphore:
+                        info, holding_result = await asyncio.gather(
+                            self._fund_info(code), self._holdings(code)
+                        )
+                    holdings, holding_date = holding_result
+                    prepared[code] = (info, holdings, holding_date)
+                except Exception as exc:
+                    logger.exception("fund preparation failed for %s", code)
+                    errors[code] = str(exc) or "基金资料暂时不可用"
+
+            await asyncio.gather(*(prepare(code) for code in unique_codes))
+            all_holdings = [
+                holding
+                for _, holdings, _ in prepared.values()
+                for holding in holdings
+            ]
+            quote_refresh_failed = False
+            try:
+                quotes = await self._quotes(all_holdings)
+            except Exception:
+                logger.exception("shared quote refresh failed")
+                quotes = {}
+                quote_refresh_failed = True
+
+            refreshed_at = time.monotonic()
+            async with self._state_lock:
+                snapshots = {}
+                for code, (info, holdings, holding_date) in prepared.items():
+                    # If real-time quotes fail, keep the last known good
+                    # snapshot. Only brand-new funds receive an official-NAV
+                    # fallback until the next background refresh succeeds.
+                    if quote_refresh_failed and holdings and code in self._snapshots:
+                        continue
+                    snapshots[code] = self._build_estimate(
+                        info, holdings, holding_date, quotes
+                    )
+                for code, snapshot in snapshots.items():
+                    self._snapshots[code] = snapshot
+                    self._snapshot_times[code] = refreshed_at
+                    self._last_errors.pop(code, None)
+                for code, error in errors.items():
+                    self._last_errors[code] = error
+
+    async def get_estimates(self, codes: list[str]) -> list[dict[str, Any]]:
+        """Return cached snapshots; initialise only previously unseen funds."""
+        unique_codes = self._normalise_codes(codes)
+        await self._register_active(unique_codes)
+        async with self._state_lock:
+            missing = [code for code in unique_codes if code not in self._snapshots]
+        if missing:
+            await self._refresh_codes(missing)
+
+        async with self._state_lock:
+            return [
+                self._snapshots.get(code)
+                or {"code": code, "error": self._last_errors.get(code, "正在初始化估值，请稍后刷新")}
+                for code in unique_codes
+            ]
+
+    async def estimate_many(self, codes: list[str]) -> list[dict[str, Any]]:
+        """Force an immediate shared refresh, mainly for tests and administration."""
+        unique_codes = self._normalise_codes(codes)
+        await self._register_active(unique_codes)
+        await self._refresh_codes(unique_codes, force=True)
+        return await self.get_estimates(unique_codes)
+
+    async def estimate(self, code: str) -> dict[str, Any]:
+        result = (await self.get_estimates([code]))[0]
+        if result.get("error"):
+            raise FundDataError(result["error"])
+        return result
+
+    async def _refresh_loop(self) -> None:
+        while True:
+            await asyncio.sleep(REFRESH_INTERVAL)
+            codes = await self._active_code_list()
+            if not codes:
+                continue
+            try:
+                # Refresh the whole active universe together. Metadata work is
+                # concurrency-limited, while all holdings share one deduplicated
+                # quote universe. This avoids repeating the same stock request
+                # for different users and fund groups.
+                await self._refresh_codes(codes, force=True, limit=None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("background snapshot refresh failed")
+
+    async def stats(self) -> dict[str, int]:
+        async with self._state_lock:
+            return {
+                "activeFunds": len(self._active_codes),
+                "cachedSnapshots": len(self._snapshots),
+            }

@@ -4,6 +4,7 @@ const DEFAULT_FUNDS = ['090007', '006122', '090010'];
 const state = {
   funds: JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null') || DEFAULT_FUNDS,
   results: new Map(),
+  refreshing: false,
 };
 
 const list = document.querySelector('#fund-list');
@@ -98,8 +99,35 @@ async function loadFund(code) {
 }
 
 async function refreshAll() {
-  await Promise.all(state.funds.map(loadFund));
-  document.querySelector('#last-refresh').textContent = `最后刷新 ${new Date().toLocaleTimeString('zh-CN')}`;
+  if (state.refreshing || state.funds.length === 0) return;
+  state.refreshing = true;
+  state.funds.forEach(code => {
+    const card = list.querySelector(`[data-code="${code}"]`) || createCard(code);
+    card.classList.add('loading');
+  });
+  try {
+    const response = await fetch(`/api/funds?codes=${encodeURIComponent(state.funds.join(','))}`);
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || '数据读取失败');
+    body.funds.forEach(data => {
+      const card = list.querySelector(`[data-code="${data.code}"]`);
+      if (data.error) {
+        state.results.set(data.code, { error: data.error });
+        renderError(card, data.error);
+      } else {
+        state.results.set(data.code, data);
+        renderResult(card, data);
+      }
+    });
+  } catch (error) {
+    state.funds.forEach(code => {
+      const card = list.querySelector(`[data-code="${code}"]`);
+      renderError(card, error.message);
+    });
+  } finally {
+    state.refreshing = false;
+    document.querySelector('#last-refresh').textContent = `最后刷新 ${new Date().toLocaleTimeString('zh-CN')}`;
+  }
 }
 
 function addFund() {

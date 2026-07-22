@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.fund_service import FundDataError, FundService
+from app.fund_service import MAX_FUNDS_PER_REQUEST, FundDataError, FundService
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,6 +18,7 @@ service = FundService()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await service.start()
     yield
     await service.close()
 
@@ -44,8 +44,8 @@ async def index() -> FileResponse:
 
 
 @app.get("/api/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health():
+    return {"status": "ok", **await service.stats()}
 
 
 @app.get("/api/funds/{code}")
@@ -59,16 +59,10 @@ async def fund_estimate(code: str):
 
 
 @app.get("/api/funds")
-async def fund_estimates(codes: str = Query(..., description="逗号分隔的基金代码，最多 10 个")):
-    code_list = list(dict.fromkeys(item.strip() for item in codes.split(",") if item.strip()))[:10]
-    results = await asyncio.gather(
-        *(service.estimate(code) for code in code_list), return_exceptions=True
-    )
-    payload = []
-    for code, result in zip(code_list, results):
-        if isinstance(result, Exception):
-            payload.append({"code": code, "error": str(result)})
-        else:
-            payload.append(result)
-    return {"funds": payload}
-
+async def fund_estimates(
+    codes: str = Query(..., description=f"逗号分隔的基金代码，最多 {MAX_FUNDS_PER_REQUEST} 个")
+):
+    code_list = list(dict.fromkeys(item.strip() for item in codes.split(",") if item.strip()))[
+        :MAX_FUNDS_PER_REQUEST
+    ]
+    return {"funds": await service.get_estimates(code_list)}
