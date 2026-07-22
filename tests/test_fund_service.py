@@ -125,3 +125,50 @@ def test_failed_quote_refresh_keeps_last_snapshot():
             await service.close()
 
     asyncio.run(run())
+
+
+def test_partial_empty_quotes_do_not_replace_complete_snapshot():
+    service = FundService()
+    previous = {
+        "code": "000001",
+        "estimatedNav": 1.2345,
+        "quoteCoveragePct": 100,
+    }
+
+    async def fake_info(code):
+        return {
+            "code": code,
+            "name": "测试基金",
+            "officialNav": 1.0,
+            "officialChangePct": 0,
+            "navDate": "2026-07-21",
+            "stockPositionPct": 80,
+            "allocationDate": "2026-06-30",
+        }
+
+    async def fake_holdings(code):
+        return ([{
+            "code": "600000",
+            "name": "浦发银行",
+            "weightPct": 10,
+            "market": "1",
+            "sector": "银行",
+        }], "2026-06-30")
+
+    async def partial_quotes(holdings):
+        return {}
+
+    service._fund_info = fake_info
+    service._holdings = fake_holdings
+    service._quotes = partial_quotes
+
+    async def run():
+        try:
+            service._snapshots["000001"] = previous
+            service._snapshot_times["000001"] = 1
+            await service._refresh_codes(["000001"], force=True)
+            assert service._snapshots["000001"] is previous
+        finally:
+            await service.close()
+
+    asyncio.run(run())

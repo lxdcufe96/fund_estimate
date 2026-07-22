@@ -316,29 +316,38 @@ class FundService:
         cached = await cache.get(key)
         if cached is not None:
             return cached
-        stale = await cache.get_stale(key)
         chunks = [unique[index:index + QUOTE_BATCH_SIZE] for index in range(0, len(unique), QUOTE_BATCH_SIZE)]
 
         async def fetch_chunk(chunk: list[str]) -> dict[str, dict[str, Any]]:
-            async with self._quote_semaphore:
-                response = await self._get_with_retry(
-                    EASTMONEY_QUOTES,
-                    params={"secids": ",".join(chunk), "fields": "f2,f3,f12,f13,f14"},
-                )
-            return _parse_quotes(response.json())
+            chunk_ids = ",".join(chunk)
+            chunk_key = f"quote-chunk:{chunk_ids}"
+            chunk_cached = await cache.get(chunk_key)
+            if chunk_cached is not None:
+                return chunk_cached
+            chunk_stale = await cache.get_stale(chunk_key)
+            try:
+                async with self._quote_semaphore:
+                    response = await self._get_with_retry(
+                        EASTMONEY_QUOTES,
+                        params={"secids": chunk_ids, "fields": "f2,f3,f12,f13,f14"},
+                    )
+                value = _parse_quotes(response.json())
+                await cache.set(chunk_key, value, QUOTES_TTL)
+                return value
+            except Exception:
+                if chunk_stale:
+                    logger.warning("quote chunk refresh failed; using stale chunk")
+                    return chunk_stale
+                logger.warning("quote chunk refresh failed; skipping %s symbols", len(chunk))
+                return {}
 
-        try:
-            parts = await asyncio.gather(*(fetch_chunk(chunk) for chunk in chunks))
-            value: dict[str, dict[str, Any]] = {}
-            for part in parts:
-                value.update(part)
+        parts = await asyncio.gather(*(fetch_chunk(chunk) for chunk in chunks))
+        value: dict[str, dict[str, Any]] = {}
+        for part in parts:
+            value.update(part)
+        if value:
             await cache.set(key, value, QUOTES_TTL)
-            return value
-        except Exception:
-            if stale:
-                logger.warning("quote refresh failed; using stale quote cache")
-                return stale
-            raise
+        return value
 
     def _build_estimate(
         self,
@@ -397,6 +406,7 @@ class FundService:
             **info,
             "estimatedNav": round(estimated_nav, 4),
             "estimatedChangePct": round(estimated_change, 4),
+            "realtimeAvailable": quoted_weight > 0,
             "holdingDate": holding_date,
             "holdingCount": len(holdings),
             "disclosedWeightPct": round(disclosed_weight, 2),
@@ -505,9 +515,18 @@ class FundService:
                     # fallback until the next background refresh succeeds.
                     if quote_refresh_failed and holdings and code in self._snapshots:
                         continue
-                    snapshots[code] = self._build_estimate(
+                    candidate = self._build_estimate(
                         info, holdings, holding_date, quotes
                     )
+                    previous = self._snapshots.get(code)
+                    if (
+                        previous
+                        and holdings
+                        and candidate.get("quoteCoveragePct", 0) < 50
+                        and previous.get("quoteCoveragePct", 0) > candidate.get("quoteCoveragePct", 0)
+                    ):
+                        continue
+                    snapshots[code] = candidate
                 for code, snapshot in snapshots.items():
                     self._snapshots[code] = snapshot
                     self._snapshot_times[code] = refreshed_at

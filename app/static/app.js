@@ -52,10 +52,17 @@ function createCard(code) {
 function renderResult(card, data) {
   card.classList.remove('loading', 'failed');
   card.querySelector('.fund-name').textContent = data.name;
-  card.querySelector('.estimated-nav').textContent = Number(data.estimatedNav).toFixed(4);
+  card.querySelector('.estimated-nav').textContent = data.realtimeAvailable === false
+    ? '—'
+    : Number(data.estimatedNav).toFixed(4);
   const estimatedChange = card.querySelector('.estimated-change');
-  estimatedChange.textContent = signed(data.estimatedChangePct);
-  estimatedChange.className = `estimated-change ${directionClass(data.estimatedChangePct)}`;
+  if (data.realtimeAvailable === false) {
+    estimatedChange.textContent = '等待行情';
+    estimatedChange.className = 'estimated-change';
+  } else {
+    estimatedChange.textContent = signed(data.estimatedChangePct);
+    estimatedChange.className = `estimated-change ${directionClass(data.estimatedChangePct)}`;
+  }
   card.querySelector('.official-nav').textContent = Number(data.officialNav).toFixed(4);
   const officialChange = card.querySelector('.official-change');
   officialChange.textContent = signed(data.officialChangePct);
