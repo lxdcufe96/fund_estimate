@@ -95,9 +95,6 @@ function renderResult(card, data) {
     `股票仓位 ${data.stockPositionPct}%`,
     `前十大占比 ${data.disclosedWeightPct}%`,
     `持仓期 ${data.holdingDate || '未知'}`,
-    `行情 ${quoteClock(data.quoteUpdatedAt)}`,
-    `行情源 ${data.quoteSource || '等待中'}`,
-    data.marketStatus,
   ].map(item => `<span class="fact">${item}</span>`).join('');
 
   card.querySelector('.holdings').innerHTML = data.holdings.map(item => `

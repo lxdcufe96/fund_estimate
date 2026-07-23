@@ -191,7 +191,13 @@ input::placeholder { color: #b6b7be; }
 }
 .holding b { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .holding small { color: var(--muted); }
-.holding strong, .holding small:last-child { font-variant-numeric: tabular-nums; }
+.holding strong,
+.holding small:last-child {
+  min-width: 76px;
+  justify-self: end;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 
 .card-error { display: none; margin: 0 22px 18px; padding: 11px 13px; border-radius: 10px; background: #fff2f2; color: var(--red); font-size: 12px; }
 .fund-card.failed .card-error { display: block; }
