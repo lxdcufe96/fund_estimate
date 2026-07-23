@@ -20,10 +20,10 @@ CHINA_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 FUND_INFO_TTL = 21600
 HOLDINGS_TTL = 86400
 QUOTES_TTL = 20
-REFRESH_INTERVAL = 60
-ACTIVE_CODE_TTL = 86400
+REFRESH_INTERVAL = 30
+ACTIVE_CODE_TTL = 600
 MAX_FUNDS_PER_REQUEST = 100
-QUOTE_BATCH_SIZE = 80
+QUOTE_BATCH_SIZE = 100
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,9 @@ class TTLCache:
         async with self._lock:
             entry = self._items.get(key)
             if not entry or entry.expires_at <= time.time():
-                self._items.pop(key, None)
+                # Keep expired entries for stale-if-error fallback. Successful
+                # refreshes overwrite them; inactive fund snapshots are pruned
+                # separately by the service registry.
                 return None
             return entry.value
 
@@ -62,6 +64,13 @@ class TTLCache:
 
 
 cache = TTLCache()
+
+
+def _is_trading_time(now: datetime) -> bool:
+    if now.weekday() >= 5:
+        return False
+    minute = now.hour * 60 + now.minute
+    return 570 <= minute <= 690 or 780 <= minute < 900
 
 
 def _extract_json_variable(text: str, variable: str) -> Any:
@@ -194,6 +203,7 @@ def _parse_holdings(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], str 
 
 def _parse_quotes(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
+    fetched_at = datetime.now(CHINA_TZ).isoformat(timespec="seconds")
     for row in ((payload.get("data") or {}).get("diff") or []):
         code = str(row.get("f12") or "")
         raw_change = row.get("f3")
@@ -201,10 +211,20 @@ def _parse_quotes(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if not code or raw_change in (None, "-"):
             continue
         market = str(row.get("f13") or "")
+        raw_quote_time = row.get("f124")
+        quote_time = fetched_at
+        if raw_quote_time not in (None, "-", 0, "0"):
+            try:
+                quote_time = datetime.fromtimestamp(
+                    int(raw_quote_time), tz=CHINA_TZ
+                ).isoformat(timespec="seconds")
+            except (TypeError, ValueError, OSError):
+                pass
         quote = {
             "name": row.get("f14") or code,
             "price": None if raw_price in (None, "-") else round(float(raw_price) / 100, 4),
             "changePct": round(float(raw_change) / 100, 4),
+            "quoteTime": quote_time,
         }
         result[code] = quote
         if market:
@@ -226,8 +246,11 @@ class FundService:
         self._state_lock = asyncio.Lock()
         self._refresh_lock = asyncio.Lock()
         self._metadata_semaphore = asyncio.Semaphore(8)
-        self._quote_semaphore = asyncio.Semaphore(4)
+        self._quote_semaphore = asyncio.Semaphore(8)
         self._background_task: asyncio.Task | None = None
+        self._last_background_refresh_at: str | None = None
+        self._last_background_duration_ms = 0
+        self._last_background_error: str | None = None
 
     async def start(self) -> None:
         if self._background_task is None:
@@ -245,17 +268,25 @@ class FundService:
         await self.client.aclose()
 
     async def _get_with_retry(
-        self, url: str, *, params: dict[str, str] | None = None
+        self,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        attempts: int = 3,
+        timeout: float | None = None,
     ) -> httpx.Response:
         last_error: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(attempts):
             try:
-                response = await self.client.get(url, params=params)
+                response = await self.client.get(
+                    url, params=params, headers=headers, timeout=timeout
+                )
                 response.raise_for_status()
                 return response
             except (httpx.HTTPError, httpx.TimeoutException) as exc:
                 last_error = exc
-                if attempt < 2:
+                if attempt < attempts - 1:
                     await asyncio.sleep(0.35 * (2 ** attempt))
         assert last_error is not None
         raise last_error
@@ -307,6 +338,69 @@ class FundService:
                 return stale
             raise
 
+    async def _tencent_quotes(
+        self, secids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        symbols: list[str] = []
+        for secid in secids:
+            market, code = secid.split(".", 1)
+            if market == "1":
+                symbols.append(f"sh{code}")
+            elif market == "0":
+                symbols.append(f"sz{code}")
+            elif market == "116":
+                symbols.append(f"hk{code.zfill(5)}")
+        if not symbols:
+            return {}
+
+        response = await self._get_with_retry(
+            "https://qt.gtimg.cn/q=" + ",".join(symbols),
+            headers={"Referer": "https://gu.qq.com"},
+            attempts=1,
+            timeout=5.0,
+        )
+        text = response.content.decode("gbk", errors="ignore")
+        result: dict[str, dict[str, Any]] = {}
+        for line in text.splitlines():
+            if '="' not in line:
+                continue
+            symbol = line.split('="', 1)[0].removeprefix("v_")
+            parts = line.split('="', 1)[1].rstrip('";').split("~")
+            if len(parts) <= 32 or not parts[2] or not parts[3]:
+                continue
+            if symbol.startswith("sh"):
+                market = "1"
+            elif symbol.startswith("sz"):
+                market = "0"
+            elif symbol.startswith("hk"):
+                market = "116"
+            else:
+                continue
+            code = parts[2]
+            try:
+                price = float(parts[3])
+                change = float(parts[32])
+            except (TypeError, ValueError):
+                continue
+            quote_time = datetime.now(CHINA_TZ)
+            raw_time = parts[30]
+            for fmt in ("%Y%m%d%H%M%S", "%Y/%m/%d %H:%M:%S"):
+                try:
+                    quote_time = datetime.strptime(raw_time, fmt).replace(tzinfo=CHINA_TZ)
+                    break
+                except ValueError:
+                    continue
+            quote = {
+                "name": parts[1] or code,
+                "price": price,
+                "changePct": change,
+                "quoteTime": quote_time.isoformat(timespec="seconds"),
+                "source": "tencent",
+            }
+            result[code] = quote
+            result[f"{market}.{code}"] = quote
+        return result
+
     async def _quotes(self, holdings: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         if not holdings:
             return {}
@@ -329,12 +423,25 @@ class FundService:
                 async with self._quote_semaphore:
                     response = await self._get_with_retry(
                         EASTMONEY_QUOTES,
-                        params={"secids": chunk_ids, "fields": "f2,f3,f12,f13,f14"},
+                        params={"secids": chunk_ids, "fields": "f2,f3,f12,f13,f14,f124"},
+                        attempts=1,
+                        timeout=5.0,
                     )
                 value = _parse_quotes(response.json())
+                for quote in value.values():
+                    quote["source"] = "eastmoney"
                 await cache.set(chunk_key, value, QUOTES_TTL)
                 return value
             except Exception:
+                try:
+                    async with self._quote_semaphore:
+                        value = await self._tencent_quotes(chunk)
+                    if value:
+                        await cache.set(chunk_key, value, QUOTES_TTL)
+                        logger.info("eastmoney quote failed; switched to tencent")
+                        return value
+                except Exception:
+                    logger.warning("tencent quote fallback also failed")
                 if chunk_stale:
                     logger.warning("quote chunk refresh failed; using stale chunk")
                     return chunk_stale
@@ -358,6 +465,8 @@ class FundService:
     ) -> dict[str, Any]:
         weighted_change = 0.0
         quoted_weight = 0.0
+        quote_times: list[str] = []
+        quote_sources: set[str] = set()
         detailed: list[dict[str, Any]] = []
         for holding in holdings:
             quote = quotes.get(f"{holding['market']}.{holding['code']}") or quotes.get(holding["code"])
@@ -367,6 +476,10 @@ class FundService:
                 change = quote["changePct"]
                 quoted_weight += weight
                 weighted_change += weight * change
+                if quote.get("quoteTime"):
+                    quote_times.append(quote["quoteTime"])
+                if quote.get("source"):
+                    quote_sources.add(quote["source"])
                 item.update(
                     price=quote["price"],
                     changePct=change,
@@ -392,6 +505,14 @@ class FundService:
 
         estimated_nav = info["officialNav"] * (1 + estimated_change / 100)
         now = datetime.now(CHINA_TZ)
+        is_trading = _is_trading_time(now)
+        quote_updated_at = min(quote_times) if quote_times else None
+        quote_age_seconds = None
+        if quote_updated_at:
+            quote_age_seconds = max(
+                0,
+                int((now - datetime.fromisoformat(quote_updated_at)).total_seconds()),
+            )
         warnings = ["估值依据最近一期披露持仓推算，不等于基金公司最终净值。"]
         if not holdings:
             warnings.append("未获取到股票持仓，当前仅展示官方净值。")
@@ -407,6 +528,12 @@ class FundService:
             "estimatedNav": round(estimated_nav, 4),
             "estimatedChangePct": round(estimated_change, 4),
             "realtimeAvailable": quoted_weight > 0,
+            "quoteUpdatedAt": quote_updated_at,
+            "quoteSource": "+".join(sorted(quote_sources)) or None,
+            "quoteAgeSeconds": quote_age_seconds,
+            "realtimeStale": is_trading and (
+                quote_age_seconds is None or quote_age_seconds > 180
+            ),
             "holdingDate": holding_date,
             "holdingCount": len(holdings),
             "disclosedWeightPct": round(disclosed_weight, 2),
@@ -414,7 +541,7 @@ class FundService:
             "portfolioCoveragePct": round(min(portfolio_coverage, 100), 1),
             "confidence": confidence,
             "updatedAt": now.isoformat(timespec="seconds"),
-            "marketStatus": "交易中" if now.weekday() < 5 and 9 <= now.hour < 15 else "非交易时段",
+            "marketStatus": "交易中" if is_trading else "非交易时段",
             "holdings": detailed,
             "warnings": warnings,
             "method": "最近披露股票持仓加权涨跌 × 股票仓位",
@@ -569,20 +696,32 @@ class FundService:
             codes = await self._active_code_list()
             if not codes:
                 continue
+            started_at = time.monotonic()
             try:
                 # Refresh the whole active universe together. Metadata work is
                 # concurrency-limited, while all holdings share one deduplicated
                 # quote universe. This avoids repeating the same stock request
                 # for different users and fund groups.
                 await self._refresh_codes(codes, force=True, limit=None)
+                self._last_background_refresh_at = datetime.now(CHINA_TZ).isoformat(
+                    timespec="seconds"
+                )
+                self._last_background_duration_ms = int(
+                    (time.monotonic() - started_at) * 1000
+                )
+                self._last_background_error = None
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                self._last_background_error = str(exc)
                 logger.exception("background snapshot refresh failed")
 
-    async def stats(self) -> dict[str, int]:
+    async def stats(self) -> dict[str, Any]:
         async with self._state_lock:
             return {
                 "activeFunds": len(self._active_codes),
                 "cachedSnapshots": len(self._snapshots),
+                "lastBackgroundRefreshAt": self._last_background_refresh_at,
+                "lastBackgroundDurationMs": self._last_background_duration_ms,
+                "lastBackgroundError": self._last_background_error,
             }

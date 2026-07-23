@@ -38,6 +38,16 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.middleware("http")
+async def disable_api_cache(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -60,9 +70,12 @@ async def fund_estimate(code: str):
 
 @app.get("/api/funds")
 async def fund_estimates(
-    codes: str = Query(..., description=f"逗号分隔的基金代码，最多 {MAX_FUNDS_PER_REQUEST} 个")
+    codes: str = Query(..., description=f"逗号分隔的基金代码，最多 {MAX_FUNDS_PER_REQUEST} 个"),
+    refresh: bool = Query(False, description="是否立即刷新这些基金"),
 ):
     code_list = list(dict.fromkeys(item.strip() for item in codes.split(",") if item.strip()))[
         :MAX_FUNDS_PER_REQUEST
     ]
+    if refresh:
+        return {"funds": await service.estimate_many(code_list)}
     return {"funds": await service.get_estimates(code_list)}

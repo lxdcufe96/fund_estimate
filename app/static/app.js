@@ -32,6 +32,29 @@ function escapeHtml(value) {
   })[char]);
 }
 
+function quoteClock(value) {
+  if (!value) return '等待行情';
+  return new Date(value).toLocaleTimeString('zh-CN', {
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+}
+
+function updateQuoteStatus() {
+  const values = [...state.results.values()].filter(item => !item.error);
+  const quoteValues = values.filter(item => item.quoteUpdatedAt);
+  if (!quoteValues.length) {
+    document.querySelector('#last-refresh').textContent = '等待实时行情';
+    return;
+  }
+  const oldest = quoteValues.reduce((result, item) => (
+    new Date(item.quoteUpdatedAt) < new Date(result.quoteUpdatedAt) ? item : result
+  ));
+  const delayed = quoteValues.some(item => item.realtimeStale);
+  document.querySelector('#last-refresh').textContent = delayed
+    ? `部分行情延迟 · ${quoteClock(oldest.quoteUpdatedAt)}`
+    : `行情更新 ${quoteClock(oldest.quoteUpdatedAt)}`;
+}
+
 function createCard(code) {
   const card = template.content.firstElementChild.cloneNode(true);
   card.dataset.code = code;
@@ -72,6 +95,8 @@ function renderResult(card, data) {
     `股票仓位 ${data.stockPositionPct}%`,
     `前十大占比 ${data.disclosedWeightPct}%`,
     `持仓期 ${data.holdingDate || '未知'}`,
+    `行情 ${quoteClock(data.quoteUpdatedAt)}`,
+    `行情源 ${data.quoteSource || '等待中'}`,
     data.marketStatus,
   ].map(item => `<span class="fact">${item}</span>`).join('');
 
@@ -105,7 +130,7 @@ async function loadFund(code) {
   }
 }
 
-async function refreshAll() {
+async function refreshAll(force = false) {
   if (state.refreshing || state.funds.length === 0) return;
   state.refreshing = true;
   state.funds.forEach(code => {
@@ -113,7 +138,8 @@ async function refreshAll() {
     card.classList.add('loading');
   });
   try {
-    const response = await fetch(`/api/funds?codes=${encodeURIComponent(state.funds.join(','))}`);
+    const query = `/api/funds?codes=${encodeURIComponent(state.funds.join(','))}${force ? '&refresh=true' : ''}`;
+    const response = await fetch(query, { cache: 'no-store' });
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || '数据读取失败');
     body.funds.forEach(data => {
@@ -126,14 +152,15 @@ async function refreshAll() {
         renderResult(card, data);
       }
     });
+    updateQuoteStatus();
   } catch (error) {
     state.funds.forEach(code => {
       const card = list.querySelector(`[data-code="${code}"]`);
       renderError(card, error.message);
     });
+    document.querySelector('#last-refresh').textContent = '刷新失败，请重试';
   } finally {
     state.refreshing = false;
-    document.querySelector('#last-refresh').textContent = `最后刷新 ${new Date().toLocaleTimeString('zh-CN')}`;
   }
 }
 
@@ -165,9 +192,9 @@ function removeFund(code) {
 }
 
 document.querySelector('#add-button').addEventListener('click', addFund);
-document.querySelector('#refresh-button').addEventListener('click', refreshAll);
+document.querySelector('#refresh-button').addEventListener('click', () => refreshAll(true));
 input.addEventListener('keydown', event => { if (event.key === 'Enter') addFund(); });
 
 state.funds.forEach(createCard);
 refreshAll();
-setInterval(refreshAll, 60_000);
+setInterval(() => refreshAll(false), 30_000);

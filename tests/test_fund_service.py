@@ -1,6 +1,6 @@
 import asyncio
 
-from app.fund_service import FundService, _parse_fund_script, _parse_holdings, _parse_quotes
+from app.fund_service import TTLCache, FundService, _parse_fund_script, _parse_holdings, _parse_quotes
 
 
 def test_parse_fund_script():
@@ -29,6 +29,42 @@ def test_parse_quotes_scaling():
     result = _parse_quotes(payload)
     assert result["600000"]["price"] == 12.34
     assert result["600000"]["changePct"] == -0.56
+
+
+def test_expired_cache_remains_available_as_stale():
+    item_cache = TTLCache()
+
+    async def run():
+        await item_cache.set("key", {"value": 1}, 0)
+        assert await item_cache.get("key") is None
+        assert await item_cache.get_stale("key") == {"value": 1}
+
+    asyncio.run(run())
+
+
+def test_tencent_quote_fallback_parser():
+    service = FundService()
+
+    class FakeResponse:
+        content = (
+            'v_sh600000="1~浦发银行~600000~10.50~10.40~10.40~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~0~20260723103000~0.10~0.96~";'
+        ).encode("gbk")
+
+    async def fake_get(*args, **kwargs):
+        return FakeResponse()
+
+    service._get_with_retry = fake_get
+
+    async def run():
+        try:
+            result = await service._tencent_quotes(["1.600000"])
+            assert result["1.600000"]["price"] == 10.5
+            assert result["1.600000"]["changePct"] == 0.96
+            assert result["1.600000"]["source"] == "tencent"
+        finally:
+            await service.close()
+
+    asyncio.run(run())
 
 
 def test_cached_reads_share_one_quote_request():
